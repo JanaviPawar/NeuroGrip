@@ -16,9 +16,17 @@ NeuroGrip monitors three signals from the steering wheel:
 
 These signals are processed in real time and used to estimate whether the driver is:
 
-- Relaxed
-- Stressed
-- Fatigued
-- In an abnormal state
+- Relaxed  
+- Stressed  
+- Fatigued  
+- In an abnormal state  
 
-The goal is to detect these conditions **before** they become visibly dangerous.
+The goal is to detect these conditions before they become visibly dangerous.
+
+---
+
+## Demo
+
+<p align="center">
+  <img src="demo.gif" width="600"/>
+</p>
