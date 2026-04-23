@@ -24,4 +24,14 @@ These signals are processed in real time and used to estimate whether the driver
 
 The goal is to detect these conditions **before** they become visibly dangerous.
 
+<<<<<<< HEAD
 ---
+=======
+---
+
+## Demo
+
+<p align="center">
+  <img src="demo.gif" width="600"/>
+</p>
+>>>>>>> 782c7a7 (Fix encoding)
