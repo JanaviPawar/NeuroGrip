@@ -1,0 +1,15 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model + data files (optional but recommended)
+*.pth
+*.csv
+
+# Runtime files
+baseline.json
+session.json
+neurogrip.log
