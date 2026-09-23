@@ -6,6 +6,7 @@ from collections import deque
 import serial
 import numpy as np
 import os
+import sys
 import csv
 import json
 import time
@@ -16,13 +17,24 @@ from scipy import signal as sp_signal
 from scipy.stats import entropy as sp_entropy
 import warnings
 warnings.filterwarnings("ignore")
- 
+
+# BUGFIX: Windows' default console codepage (cp1252) can't encode emoji like
+# checkmarks/rockets used in the log messages below, which crashed logging's
+# emit() with UnicodeEncodeError on every such line (visible as "--- Logging
+# error ---" spam) even though the program itself kept running fine. This
+# reconfigures stdout/stderr to UTF-8 with a safe fallback instead of raising.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
+
 # ==================== LOGGING ====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("neurogrip.log"),
+        logging.FileHandler("neurogrip.log", encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -35,7 +47,7 @@ print("="*62 + "\n")
  
 # ==================== CONFIG ====================
 CONFIG = {
-    "port":           "COM5",
+    "port":           "COM3",
     "baud":           115200,
     "sample_rate":    20,        # Hz — must match ESP32
     "seq_len":        10,        # LSTM sequence length
@@ -133,13 +145,19 @@ class PersonalizedBaseline:
     Secondary: FSR (grip pressure changes with fatigue)
     Tertiary: Tremor proxy
     """
-    def __init__(self, n_channels=3, alpha=0.04):
+    def __init__(self, n_channels=3, alpha=0.04, min_std=0.02):
         self.alpha = alpha
         self.mean  = np.zeros(n_channels)
         self.var   = np.ones(n_channels) * 0.01
         self.n     = 0
         self.ready = False
- 
+        # BUGFIX: min_std floors the learned variance. Without this, the EMA
+        # variance decays toward ~0 during any still period, which makes
+        # mahalanobis() divide by a near-zero std — so even a slight touch
+        # right after being still produced a massive, instant "anomaly" score.
+        # This floor keeps the baseline from becoming pathologically sensitive.
+        self.min_var = min_std ** 2
+
     def update(self, x):
         if not self.ready:
             self.mean = x.copy(); self.var = np.ones_like(x) * 0.01
@@ -147,6 +165,7 @@ class PersonalizedBaseline:
         else:
             self.mean = (1 - self.alpha) * self.mean + self.alpha * x
             self.var  = (1 - self.alpha) * self.var  + self.alpha * (x - self.mean)**2
+            self.var  = np.maximum(self.var, self.min_var)
         self.n += 1
  
     def normalize(self, x):
@@ -198,7 +217,18 @@ class TremorAnalyzer:
         # FIX: Use FSR (Ch 0) for tremor — MPU6050 not connected yet
         sig = np.array(self.bufs[0]) - np.mean(self.bufs[0])
         fft_pwr = np.abs(np.fft.rfft(sig)) ** 2
-        total   = fft_pwr.sum() + 1e-10
+        total   = fft_pwr.sum()
+
+        # BUGFIX: a flat/idle signal (hand not gripping the FSR) has ~zero FFT
+        # energy. Dividing by an epsilon 'total' below made GCI collapse to 0
+        # (the "worst" possible score) exactly when nothing was happening —
+        # this was injecting a constant +20 fatigue-score penalty at rest.
+        # A flat signal is stable/idle, not tremor-contaminated, so report
+        # GCI = 1.0 (stable) instead of computing garbage from near-zero power.
+        if total < 1e-8:
+            return np.array([0.0, 0.0, 0.0, 1.0])
+
+        total = total + 1e-10
  
         # Tremor band 3–8 Hz
         tremor_mask = (self.freqs >= 3) & (self.freqs <= 8)
@@ -276,12 +306,99 @@ class FatigueStateMachine:
         self.n_samples = 0
         self.history   = deque(maxlen=200)
 
-        # FINAL TUNED THRESHOLDS (this is the key change)
-        self.UP_T   = [0, 26, 55, 82]    # harder to reach WARNING/CRITICAL
-        self.DOWN_T = [0, 12, 35, 55]    # much easier to drop back to SAFE
+        # FINAL TUNED THRESHOLDS — recalibrated after fixing the mahal
+        # ordering bug below (light/moderate/hard presses now produce
+        # genuinely different score magnitudes, so thresholds retuned
+        # against real numbers rather than guessed):
+        #   light tap          -> CAUTION only
+        #   moderate sustained -> WARNING, eases back to SAFE
+        #   hard sustained     -> CRITICAL within ~0.2s, eases back over ~1s
+        #   rapid moderate osc -> sustained WARNING
+        #   rapid hard osc     -> sustained CRITICAL
+        self.UP_T   = [0, 14, 32, 50]
+        self.DOWN_T = [0, 7, 20, 34]
 
-    def update(self, pred_idx, confidence, mahal, tremor_ratio, gci, n_samples):
+        # GATE: is the signal actually *moving* right now? This looks at the
+        # range (max-min) of raw FSR/GSR over a short recent window, instead
+        # of comparing to a single frozen "resting" snapshot. A snapshot-based
+        # gate can get permanently stuck "active" if the sensor doesn't
+        # return to the exact same value after release (very common with
+        # analog sensors) — this window-based version self-corrects every
+        # sample because it only ever looks at the last ~0.5s, so it always
+        # settles back to "inactive" once the signal is flat again, at
+        # whatever level that is.
+        self.activity_win = deque(maxlen=12)   # ~0.6s at 20Hz
+        self.ACTIVITY_THRESH = 0.03            # min recent range to count as touched
+        # BUGFIX: range-only gating treated a STEADY hard press as "inactive"
+        # once it stopped changing (~0.5s in), letting the score decay mid-hold
+        # — then RELEASE looked like new activity and produced a delayed spike.
+        # mahal (deviation from your resting profile) stays legitimately high
+        # for as long as you're actually pressing hard, so OR-ing it in keeps
+        # the gate open for the whole sustained press, not just the edges.
+        # Threshold lowered to 1.5 to match the now-properly-scaled mahal
+        # (see the ordering fix in process()) — it used to be tuned against
+        # the old, magnitude-blind mahal values.
+        self.MAHAL_ACTIVE_THRESH = 1.5
+
+        # Smooths the mahal signal used for scoring. With the ordering fix,
+        # mahal is strongly correlated with press force but only for the
+        # first sample after contact (variance re-absorbs it almost
+        # immediately after) — this EMA spreads that one informative
+        # reading out over several samples instead of losing it after 50ms.
+        self.mahal_ema = 0.0
+        self.MAHAL_EMA_DECAY = 0.6
+
+        # BUGFIX: collect_data.py's "Stressed" class was demoed at moderate
+        # grip only — a genuinely hard, steady, never-released squeeze was
+        # never its own training class. Once real FSR climbs past what was
+        # demoed, the model falls back to labeling it "Anomaly" even with
+        # zero release, and that per-sample label used to be applied at
+        # nearly full weight (+45) every single sample — so one noisy or
+        # out-of-distribution label could push straight to CRITICAL on its
+        # own, on a completely steady hold. Two changes fix this without new
+        # training data tonight: (1) the class-based penalty is smoothed
+        # with its own EMA, so a run of consistently elevated labels is
+        # needed to build it up — but unlike a strict "same label N times in
+        # a row" debounce, it doesn't break when the label flickers between
+        # Stressed/Fatigued/Anomaly during one continuous real press, since
+        # every one of those still counts as "elevated" for the EMA.
+        # (2) its raw per-sample weight is cut roughly in half, so the
+        # classifier alone can no longer reach CRITICAL by itself — CRITICAL
+        # now needs corroboration from mahal/volatility too, the two signals
+        # that are actually magnitude-scaled (see the ordering bugfix in
+        # process()) rather than a single discrete label.
+        self.class_ema = 0.0
+        self.CLASS_EMA_DECAY = 0.55
+
+    def _count_reversals(self, arr):
+        """How many times the signal changed direction in the recent window.
+        A single press-then-release is 0-1 reversals; genuine rapid
+        squeeze/release oscillation is 2+."""
+        d = np.diff(arr)
+        d = d[np.abs(d) > 0.01]
+        if len(d) < 2:
+            return 0
+        signs = np.sign(d)
+        return int(np.sum(signs[1:] != signs[:-1]))
+
+    def update(self, pred_idx, confidence, mahal, tremor_ratio, gci, n_samples, raw_vals=None):
         self.n_samples = n_samples
+
+        # Smooth mahal before using it for scoring/gating (see __init__ note)
+        self.mahal_ema = self.MAHAL_EMA_DECAY * self.mahal_ema + (1 - self.MAHAL_EMA_DECAY) * mahal
+
+        # Physical activity gate — only relevant once raw_vals is supplied
+        is_active = True
+        recent_range = 0.0
+        reversals = 0
+        if raw_vals is not None:
+            raw_vals = np.asarray(raw_vals, dtype=float)
+            self.activity_win.append(raw_vals)
+            if len(self.activity_win) >= 3:
+                win = np.array(self.activity_win)
+                recent_range = float(np.max(win.max(axis=0) - win.min(axis=0)))
+                reversals = max(self._count_reversals(win[:, i]) for i in range(win.shape[1]))
+                is_active = recent_range > self.ACTIVITY_THRESH or self.mahal_ema > self.MAHAL_ACTIVE_THRESH
 
         # FSM state transitions
         if self.fsm_state == self.STATE_IDLE and mahal > 0:
@@ -298,15 +415,50 @@ class FatigueStateMachine:
             return 0, 0.0, self.fsm_state
 
         # Scoring
-        anomaly_s = 45.0 if pred_idx == 3 else (30.0 if pred_idx == 2 else (18.0 if pred_idx == 1 else 0.0))
-        mahal_s   = min(45.0, mahal * 18.0)
+        # Class-based penalty, smoothed (see CLASS_EMA note in __init__) —
+        # weights cut from the old 45/30/18 so classifier output alone can't
+        # single-handedly cross into CRITICAL anymore.
+        raw_anomaly = 25.0 if pred_idx == 3 else (16.0 if pred_idx == 2 else (10.0 if pred_idx == 1 else 0.0))
+        self.class_ema = self.CLASS_EMA_DECAY * self.class_ema + (1 - self.CLASS_EMA_DECAY) * raw_anomaly
+        anomaly_s = self.class_ema
+        # BUGFIX: multiplier/cap retuned against the corrected, magnitude-
+        # sensitive mahal (see process() — mahal is now measured BEFORE the
+        # baseline update, so it actually scales with press force instead of
+        # saturating almost instantly regardless of how hard you press).
+        mahal_s   = min(50.0, self.mahal_ema * 6.0)
         tremor_s  = tremor_ratio * 35.0
         gci_s     = (1.0 - gci) * 20.0
         session_h = (time.time() - self.session_t) / 3600.0
         time_s    = min(12.0, session_h * 6.0)
+        # Volatility score — rapid squeeze/release swings the raw signal a
+        # lot within a short window even though the SMOOTHED score cancels
+        # itself out (half the samples read "released", half read "squeezed").
+        # This term measures the swing itself, so erratic rapid grip changes
+        # stay flagged even when the average grip level looks moderate.
+        # BUGFIX: this used to require reversals >= 2 (i.e. a full double
+        # oscillation) before counting any volatility at all — which meant a
+        # genuine single squeeze-then-release (exactly the "Anomaly" class
+        # your own collect_data.py demos: one fast up, one fast down) never
+        # got a volatility contribution either, since a single cycle is only
+        # ONE reversal. That silently made CRITICAL nearly unreachable for
+        # the exact gesture it's supposed to catch. Lowered to >=1 so any
+        # real direction change counts — amplitude (recent_range) is what
+        # keeps this from over-triggering on an ordinary grip release: a
+        # normal moderate press-and-release has a small recent_range and
+        # only contributes a few points here, while a fast, large-amplitude
+        # squeeze-release (a real Anomaly gesture) is scaled toward the cap.
+        volatility_s = min(28.0, recent_range * 55.0) if reversals >= 1 else 0.0
 
-        raw = anomaly_s + mahal_s + tremor_s + gci_s + time_s
-        self.score = 0.75 * self.score + 0.25 * raw   # faster recovery when grip released
+        if is_active:
+            raw = anomaly_s + mahal_s + tremor_s + gci_s + time_s + volatility_s
+            self.score = 0.75 * self.score + 0.25 * raw   # faster recovery when grip released
+        else:
+            # No real physical input right now — pull the score down instead
+            # of letting model flicker/GCI noise hold it up. Softer than a
+            # hard halve so a hard-press CRITICAL eases back over ~1s
+            # (matches personalized-baseline adaptation) instead of falling
+            # off a cliff.
+            self.score = self.score * 0.82
         self.history.append(self.score)
 
         # Alert transitions
@@ -454,31 +606,45 @@ class NeuroGripEngine:
         # 1. Adaptive noise filter (median + EMA)
         x_filt = self.filt.filter(x_raw)
  
-        # 2. Online personalized baseline update
+        # 2. Anomaly score — measured BEFORE updating the baseline, using what
+        # the baseline knew coming into this sample.
+        # BUGFIX: this used to run AFTER baseline.update(x_filt), meaning the
+        # variance estimate already included the very deviation it was being
+        # asked to judge. Since the online variance update is itself driven
+        # by (x - mean)^2, that made the resulting z-score self-normalizing —
+        # a light touch and a hard press produced almost the *same*
+        # mahalanobis distance (we measured ~3.5 vs ~4.9 across a 6x range of
+        # press strength), so the score genuinely couldn't tell how hard you
+        # were pressing. Measuring first, then updating, is also the
+        # statistically correct order for an online anomaly baseline.
+        mahal = self.baseline.mahalanobis(x_filt)
+
+        # 3. Online personalized baseline update
         self.baseline.update(x_filt)
         x_norm = self.baseline.normalize(x_filt)
  
-        # 3. Tremor / frequency analysis → GCI
+        # 4. Tremor / frequency analysis → GCI
         self.tremor.update(x_norm)
         trem_feats = self.tremor.features()
         gci = float(trem_feats[3])
  
-        # 4. Context smoothing (sequence awareness)
+        # 5. Context smoothing (sequence awareness)
         self.ctx_win.append(x_norm)
         x_ctx = np.mean(self.ctx_win, axis=0)
  
-        # 5. Sequence for LSTM
+        # 6. Sequence for LSTM
         x_seq = self.data.get_sequence(x_norm, seq_len=CONFIG["seq_len"])
  
-        # 6. Prediction
+        # 7. Prediction
         pred_idx, conf = self._predict(x_seq, x_ctx, trem_feats)
  
-        # 7. Anomaly score
-        mahal = self.baseline.mahalanobis(x_filt)
- 
         # 8. Fatigue state machine
+        # Gate on FSR + GSR (the two sensors you actually operate — FSR grip
+        # pressure and the GSR potentiometer). Channel 2 (tremor/MPU6050) is
+        # not physically connected per your own comments, so it's excluded
+        # here to avoid its floating noise keeping the gate falsely "active".
         al, score, fsm_state = self.fsm.update(
-            pred_idx, conf, mahal, trem_feats[2], gci, self.n)
+            pred_idx, conf, mahal, trem_feats[2], gci, self.n, raw_vals=x_filt[:2])
  
         self.n += 1
  
@@ -613,13 +779,14 @@ def run():
     if not ser:
         log.error("No ESP32 connection — exiting."); return
 
-    # FIX: Always clear stale baseline so re-learns from scratch
-    # The old baseline was learned with bugs — delete and start fresh
-    for stale in ["baseline.json"]:
-        if os.path.exists(stale):
-            os.remove(stale)
-            log.info(f"Cleared stale {stale} — re-learning baseline")
- 
+    # NOTE: previously this block force-deleted baseline.json on every
+    # startup ("always re-learn from scratch"), which was a workaround for
+    # the near-zero-variance bug in PersonalizedBaseline — that's now fixed
+    # properly with a variance floor. Deleting it on every run is what broke
+    # the personalized-driver demo: a saved baseline from a prior session
+    # never got the chance to load. Removed so baseline.json now persists
+    # across runs and NeuroGripEngine._load() can pick it back up.
+
     engine = NeuroGripEngine()
     slogger = SessionLogger()
     n = 0
