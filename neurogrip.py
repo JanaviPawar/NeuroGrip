@@ -15,8 +15,12 @@ import threading
 from datetime import datetime
 from scipy import signal as sp_signal
 from scipy.stats import entropy as sp_entropy
+import argparse
 import warnings
 warnings.filterwarnings("ignore")
+
+import serial.tools.list_ports
+from ng_core import Scaler, window_inputs, build_model, FFT_WIN
 
 # BUGFIX: Windows' default console codepage (cp1252) can't encode emoji like
 # checkmarks/rockets used in the log messages below, which crashed logging's
@@ -41,23 +45,22 @@ logging.basicConfig(
 log = logging.getLogger("NeuroGrip")
  
 print("\n" + "="*62)
-print("    NeuroGrip v2.0 — Driver Stress & Fatigue Detection")
+print("    NeuroGrip v3.0 — Driver Stress & Fatigue Detection")
 print("    Janavi Pawar 23BCB0041 | Hardik Teotia 23BCB0052")
 print("="*62 + "\n")
  
 # ==================== CONFIG ====================
 CONFIG = {
-    "port":           "COM3",
+    "port":           None,      # None = find the ESP32 automatically, or run: python neurogrip.py --port COM5
     "baud":           115200,
     "sample_rate":    20,        # Hz — must match ESP32
     "seq_len":        10,        # LSTM sequence length
     "fft_window":     20,        # FIX: was 60. 20 samples = 1sec @ 20Hz, GCI works from sample 20
     "lr":             0.005,
     "num_classes":    4,         # Relax, Stressed, Fatigued, Anomaly
-    "retrain_every":  15,        # new samples before retrain trigger
     "alert_cooldown": 5,         # seconds between printed alerts
-    "model_path":     "model_v2.pth",
-    "data_path":      "data_v2.csv",
+    "model_path":     "model_v3.pth",   # made by train_eval.py
+    "scaler_path":    "scaler.json",    # made by train_eval.py
     "baseline_path":  "baseline.json",
     "session_path":   "session.json",
 }
@@ -66,71 +69,6 @@ CONFIG = {
 LABELS     = ["Relax", "Stressed", "Fatigued", "Anomaly"]
 ALERT_LVLS = ["SAFE", "CAUTION", "WARNING", "CRITICAL"]
 ALERT_ICONS = ["🟢", "🟡", "🟠", "🔴"]
- 
- 
-# ==================== NEURAL NETWORK ====================
-class NeuroGripNet(nn.Module):
-    """
-    Hybrid dual-branch network for grip biosignal classification.
- 
-    Branch 1 — LSTM:    Temporal grip dynamics (tremor drift, fatigue patterns)
-    Branch 2 — FFN:     Instantaneous multi-sensor fusion (FSR + GSR + tremor)
-    Branch 3 — Tremor:  FFT-derived features (GCI, spectral entropy, tremor band)
- 
-    Novel: Learnable fusion weights across branches.
-    Novel: Confidence calibration auxiliary head for uncertainty quantification.
-    """
-    def __init__(self, input_size=3, lstm_h=24, ffn_h=32, num_classes=4, seq_len=10):
-        super().__init__()
-        self.seq_len = seq_len
- 
-        # Branch 1: LSTM — captures temporal fatigue drift
-        self.lstm = nn.LSTM(input_size, lstm_h, num_layers=2,
-                            batch_first=True, dropout=0.2)
-        self.lstm_norm = nn.LayerNorm(lstm_h)
- 
-        # Branch 2: FFN — instantaneous sensor state
-        self.ffn = nn.Sequential(
-            nn.Linear(input_size, ffn_h),
-            nn.GELU(),
-            nn.LayerNorm(ffn_h),
-            nn.Dropout(0.15),
-            nn.Linear(ffn_h, ffn_h // 2),
-            nn.GELU(),
-        )
- 
-        # Branch 3: Tremor / frequency domain features
-        # Input: [dom_freq, spec_entropy, tremor_ratio, GCI]
-        self.tremor_branch = nn.Sequential(
-            nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 8)
-        )
- 
-        # Fusion (learnable weighted concat)
-        fusion_in = lstm_h + ffn_h // 2 + 8
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_in, 24),
-            nn.GELU(),
-            nn.LayerNorm(24),
-        )
-        self.classifier  = nn.Linear(24, num_classes)
-        # Auxiliary confidence head (novel: uncertainty quantification)
-        self.conf_head   = nn.Sequential(
-            nn.Linear(24, 8), nn.ReLU(), nn.Linear(8, 1), nn.Sigmoid()
-        )
-        # Learnable branch fusion weights
-        self.fw = nn.Parameter(torch.ones(3) / 3)
- 
-    def forward(self, x_seq, x_inst, x_trem):
-        lstm_out, _ = self.lstm(x_seq)
-        lf = self.lstm_norm(lstm_out[:, -1, :])
-        ff = self.ffn(x_inst)
-        tf = self.tremor_branch(x_trem)
- 
-        w  = F.softmax(self.fw, dim=0)
-        fused = torch.cat([w[0]*lf, w[1]*ff, w[2]*tf], dim=-1)
-        fused = self.fusion(fused)
- 
-        return self.classifier(fused), self.conf_head(fused)
  
  
 # ==================== ONLINE GAUSSIAN BASELINE ====================
@@ -172,9 +110,12 @@ class PersonalizedBaseline:
         std = np.sqrt(self.var + 1e-6)
         return np.clip((x - self.mean) / std / 3.0, -1, 1) * 0.5 + 0.5
  
-    def mahalanobis(self, x):
+    def mahalanobis(self, x, idx=None):
         std = np.sqrt(self.var + 1e-6)
-        return float(np.sqrt(np.sum(((x - self.mean) / std) ** 2)))
+        z = (x - self.mean) / std
+        if idx is not None:
+            z = z[idx]
+        return float(np.sqrt(np.sum(z ** 2)))
  
     def save(self, path):
         json.dump({"mean": self.mean.tolist(), "var": self.var.tolist(), "n": self.n},
@@ -381,7 +322,7 @@ class FatigueStateMachine:
         signs = np.sign(d)
         return int(np.sum(signs[1:] != signs[:-1]))
 
-    def update(self, pred_idx, confidence, mahal, tremor_ratio, gci, n_samples, raw_vals=None):
+    def update(self, pred_idx, confidence, mahal, tremor_ratio, gci, n_samples, raw_vals=None, mpu_level=0.0):
         self.n_samples = n_samples
 
         # Smooth mahal before using it for scoring/gating (see __init__ note)
@@ -398,7 +339,8 @@ class FatigueStateMachine:
                 win = np.array(self.activity_win)
                 recent_range = float(np.max(win.max(axis=0) - win.min(axis=0)))
                 reversals = max(self._count_reversals(win[:, i]) for i in range(win.shape[1]))
-                is_active = recent_range > self.ACTIVITY_THRESH or self.mahal_ema > self.MAHAL_ACTIVE_THRESH
+                is_active = (recent_range > self.ACTIVITY_THRESH or self.mahal_ema > self.MAHAL_ACTIVE_THRESH
+                             or mpu_level > 0.2)   # v3: real shaking (MPU6050) also counts as activity; a still wheel reads ~0.01-0.05
 
         # FSM state transitions
         if self.fsm_state == self.STATE_IDLE and mahal > 0:
@@ -482,117 +424,41 @@ class FatigueStateMachine:
             self.last_alert_t = now
             return True
         return False 
-# ==================== DATA MANAGER ====================
-class DataManager:
-    def __init__(self):
-        self.X   = []
-        self.y   = []
-        self.seq_buf = deque(maxlen=60)
-        self.load()
- 
-    def load(self):
-        if os.path.exists(CONFIG["data_path"]):
-            with open(CONFIG["data_path"]) as f:
-                for row in csv.reader(f):
-                    try:
-                        self.X.append([float(v) for v in row[:-1]])
-                        self.y.append(int(row[-1]))
-                    except: pass
-            log.info(f"Loaded {len(self.X)} training samples")
- 
-    def add(self, x_norm, label):
-        self.X.append(x_norm.tolist()); self.y.append(label)
- 
-    def save(self):
-        with open(CONFIG["data_path"], "w", newline="") as f:
-            w = csv.writer(f)
-            for xi, yi in zip(self.X, self.y):
-                w.writerow(xi + [yi])
- 
-    def get_sequence(self, x_norm, seq_len=10):
-        self.seq_buf.append(x_norm)
-        seq = list(self.seq_buf)
-        while len(seq) < seq_len: seq = [seq[0]] + seq
-        return np.array(seq[-seq_len:])
- 
- 
-# ==================== TRAINER ====================
-class Trainer:
-    def __init__(self, model):
-        self.model      = model
-        self.opt        = optim.AdamW(model.parameters(), lr=CONFIG["lr"], weight_decay=1e-4)
-        self.sched      = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=60)
-        self.loss_fn    = nn.CrossEntropyLoss()
-        self.last_n     = 0
-        self._lock      = threading.Lock()
- 
-    def should_train(self, n):
-        return n >= 20 and (n - self.last_n) >= CONFIG["retrain_every"]
- 
-    def train(self, data_mgr):
-        with self._lock:
-            X_raw = np.array(data_mgr.X)
-            y_raw = np.array(data_mgr.y)
-            if len(X_raw) < 20: return
- 
-            seqs, insts, trems, lbls = [], [], [], []
-            for i in range(10, len(X_raw)):
-                seq = X_raw[max(0,i-10):i]
-                while len(seq) < 10: seq = np.vstack([seq[:1], seq])
-                seqs.append(seq[-10:])
-                insts.append(X_raw[i])
-                trems.append(np.zeros(4))
-                lbls.append(y_raw[i])
- 
-            if len(seqs) < 5: return
- 
-            Xs = torch.tensor(np.array(seqs),  dtype=torch.float32)
-            Xi = torch.tensor(np.array(insts), dtype=torch.float32)
-            Xt = torch.tensor(np.array(trems), dtype=torch.float32)
-            y  = torch.tensor(np.array(lbls),  dtype=torch.long)
- 
-            self.model.train()
-            for ep in range(120):
-                logits, _ = self.model(Xs, Xi, Xt)
-                loss = self.loss_fn(logits, y)
-                self.opt.zero_grad(); loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.opt.step(); self.sched.step()
-                if loss.item() < 0.015: break
- 
-            self.model.eval()
-            torch.save(self.model.state_dict(), CONFIG["model_path"])
-            self.last_n = len(X_raw)
-            log.info(f"✅ Model retrained | Loss={loss.item():.4f} | N={len(X_raw)}")
- 
- 
 # ==================== MAIN ENGINE ====================
 class NeuroGripEngine:
     def __init__(self):
-        self.model   = NeuroGripNet(num_classes=CONFIG["num_classes"],
-                                    seq_len=CONFIG["seq_len"])
+        self.model   = build_model(num_classes=CONFIG["num_classes"])
         self.model.eval()
+        self.scaler  = None
+        self.model_ready = False
+        # Raw samples exactly as the ESP32 sent them (no Python filtering). The
+        # model was trained on raw recorded values, so it must see raw values here too.
+        self.raw_buf = deque(maxlen=FFT_WIN)
+        self.mpu_win = deque(maxlen=10)      # last 0.5 s of the MPU6050 tremor level
         self.baseline = PersonalizedBaseline(n_channels=3, alpha=0.04)
         self.tremor   = TremorAnalyzer(window=CONFIG["fft_window"],
                                        sr=CONFIG["sample_rate"])
         self.filt     = AdaptiveFilter(n=3)
         self.fsm      = FatigueStateMachine()
-        self.data     = DataManager()
-        self.trainer  = Trainer(self.model)
-        self.ctx_win  = deque(maxlen=5)
         self.dyn_thr  = 0.50
         self.n        = 0
         self.session_events = []
         self._load()
  
     def _load(self):
-        if os.path.exists(CONFIG["model_path"]):
+        if os.path.exists(CONFIG["model_path"]) and os.path.exists(CONFIG["scaler_path"]):
             try:
                 self.model.load_state_dict(
                     torch.load(CONFIG["model_path"], weights_only=True))
-                log.info("✅ Loaded model")
+                self.model.eval()
+                self.scaler = Scaler.load(CONFIG["scaler_path"])
+                self.model_ready = True
+                log.info(f"✅ Loaded {CONFIG['model_path']} + {CONFIG['scaler_path']}")
             except Exception as e:
                 log.warning(f"Model load failed: {e}")
+        if not self.model_ready:
+            log.warning("No trained model found. Run  python train_eval.py  first. "
+                        "Running with the score/alert logic only (class = Relax).")
         if os.path.exists(CONFIG["baseline_path"]):
             try:
                 self.baseline.load(CONFIG["baseline_path"])
@@ -617,7 +483,11 @@ class NeuroGripEngine:
         # press strength), so the score genuinely couldn't tell how hard you
         # were pressing. Measuring first, then updating, is also the
         # statistically correct order for an online anomaly baseline.
-        mahal = self.baseline.mahalanobis(x_filt)
+        # v3: only FSR + GSR count here. The tuned thresholds below were set when
+        # channel 2 was a fixed potentiometer that added nothing to this distance;
+        # the real MPU6050 now moves on every bump, which would change that tuning.
+        # The tremor channel reaches the decision through the model instead.
+        mahal = self.baseline.mahalanobis(x_filt, idx=[0, 1])
 
         # 3. Online personalized baseline update
         self.baseline.update(x_filt)
@@ -627,16 +497,19 @@ class NeuroGripEngine:
         self.tremor.update(x_norm)
         trem_feats = self.tremor.features()
         gci = float(trem_feats[3])
+
+        # 4b. Real tremor from the MPU6050 (channel 2), averaged over 0.5 s.
+        # trem_feats[2] is NOT the MPU: it's the 3-8 Hz share of the FSR grip
+        # signal, which stays around 0.2-0.3 no matter how you shake the wheel.
+        # The score uses whichever is higher, so behaviour with a still wheel is
+        # exactly as before (tuned thresholds unchanged), and real shaking adds to it.
+        self.mpu_win.append(float(x_raw[2]))
+        mpu_trem = float(np.mean(self.mpu_win))
+        tremor_for_score = max(float(trem_feats[2]), mpu_trem)
  
-        # 5. Context smoothing (sequence awareness)
-        self.ctx_win.append(x_norm)
-        x_ctx = np.mean(self.ctx_win, axis=0)
- 
-        # 6. Sequence for LSTM
-        x_seq = self.data.get_sequence(x_norm, seq_len=CONFIG["seq_len"])
- 
-        # 7. Prediction
-        pred_idx, conf = self._predict(x_seq, x_ctx, trem_feats)
+        # 5-7. Model prediction on the same inputs it was trained on (see ng_core.py)
+        self.raw_buf.append(x_raw)
+        pred_idx, conf = self._predict()
  
         # 8. Fatigue state machine
         # Gate on FSR + GSR (the two sensors you actually operate — FSR grip
@@ -644,14 +517,13 @@ class NeuroGripEngine:
         # not physically connected per your own comments, so it's excluded
         # here to avoid its floating noise keeping the gate falsely "active".
         al, score, fsm_state = self.fsm.update(
-            pred_idx, conf, mahal, trem_feats[2], gci, self.n, raw_vals=x_filt[:2])
+            pred_idx, conf, mahal, tremor_for_score, gci, self.n, raw_vals=x_filt[:2], mpu_level=mpu_trem)
  
         self.n += 1
  
-        # 9. Adaptive training (background thread)
-        if self.trainer.should_train(len(self.data.X)):
-            threading.Thread(target=self.trainer.train,
-                             args=(self.data,), daemon=True).start()
+        # 9. (v3) No more background retraining while driving. The old version retrained
+        # the same model object in a thread while it was being used for predictions,
+        # with dropout switched on. Training now happens offline in train_eval.py.
  
         # 10. Periodic saves
         if self.n % 100 == 0:
@@ -667,7 +539,9 @@ class NeuroGripEngine:
             "score":       round(score, 2),
             "mahal":       round(mahal, 3),
             "gci":         round(gci, 3),
-            "tremor":      round(float(trem_feats[2]), 3),
+            "tremor":      round(tremor_for_score, 3),        # value used in the score
+            "grip_tremor": round(float(trem_feats[2]), 3),    # 3-8 Hz share of the FSR signal
+            "mpu_tremor":  round(mpu_trem, 3),                # MPU6050 shaking level (0-1)
             "dom_freq":    round(float(trem_feats[0]) * 10, 2),
             "fsm_state":   fsm_state,
             # Raw sensor values for display
@@ -676,11 +550,14 @@ class NeuroGripEngine:
             "tremor_raw":  round(float(x_filt[2]), 4),
         }
  
-    def _predict(self, x_seq, x_ctx, trem_feats):
+    def _predict(self):
+        if not self.model_ready or len(self.raw_buf) < FFT_WIN:
+            return 0, 0.0
+        x_seq, x_inst, trem_in = window_inputs(np.array(self.raw_buf), self.scaler)
         with torch.no_grad():
-            s = torch.tensor(x_seq,      dtype=torch.float32).unsqueeze(0)
-            i = torch.tensor(x_ctx,      dtype=torch.float32).unsqueeze(0)
-            t = torch.tensor(trem_feats, dtype=torch.float32).unsqueeze(0)
+            s = torch.tensor(x_seq,   dtype=torch.float32).unsqueeze(0)
+            i = torch.tensor(x_inst,  dtype=torch.float32).unsqueeze(0)
+            t = torch.tensor(trem_in, dtype=torch.float32).unsqueeze(0)
             logits, cal_conf = self.model(s, i, t)
             probs = F.softmax(logits, dim=1)
             pred  = int(torch.argmax(probs).item())
@@ -700,7 +577,20 @@ class NeuroGripEngine:
  
  
 # ==================== SERIAL ====================
+def find_port():
+    ports = list(serial.tools.list_ports.comports())
+    for p in ports:
+        d = f"{p.description} {p.manufacturer or ''}".lower()
+        if any(k in d for k in ("cp210", "ch340", "ch910", "usb-serial", "usb serial", "uart", "esp32", "silicon labs", "wch")):
+            return p.device
+    return ports[0].device if len(ports) == 1 else None
+
+
 def connect_serial():
+    CONFIG["port"] = CONFIG["port"] or find_port()
+    if not CONFIG["port"]:
+        log.error("ESP32 not found. Plug it in, or run: python neurogrip.py --port COM5")
+        return None
     try:
         ser = serial.Serial(CONFIG["port"], CONFIG["baud"], timeout=1)
         log.info(f"✅ ESP32 connected on {CONFIG['port']}")
@@ -742,7 +632,8 @@ def display_status(r):
         f"Conf:{r['confidence']:.2f} | "
         f"Score:{r['score']:5.1f} | "
         f"GCI:{r['gci']:.2f} | "
-        f"Tremor:{r['tremor']:.2f} | "
+        f"MPU:{r['mpu_tremor']:.2f} | "
+        f"GripTrem:{r['grip_tremor']:.2f} | "
         f"GSR(Bio):{r['gsr']:.3f} | "
         f"FSR:{r['fsr']:.3f} | "
         f"FSM:{r['fsm_state']}",
@@ -826,10 +717,14 @@ def run():
     except KeyboardInterrupt:
         print("\n\nShutting down NeuroGrip...")
         engine.baseline.save(CONFIG["baseline_path"])
-        engine.data.save()
         slogger.save()
         log.info("All data saved. Goodbye.")
  
  
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", help="e.g. COM5 or /dev/ttyUSB0 (default: auto-detect)")
+    _a = ap.parse_args()
+    if _a.port:
+        CONFIG["port"] = _a.port
     run()

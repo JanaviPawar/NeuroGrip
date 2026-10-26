@@ -1,328 +1,179 @@
-"""
-NeuroGrip — Data Collection & Labeling Tool  (FIXED v2.1)
-==========================================================
-Run this BEFORE neurogrip_main.py to collect labeled training data.
- 
-FIXES in this version:
-  - ESP32 sends normalized float values (0.0–1.0), NOT raw ADC ints.
-    Old script applied EMA on top → double-filtered → dead signal. REMOVED.
-  - Skips ALL non-data lines: RAW:, HB, NEUROGRIP, QUEUE FAIL, etc.
-  - Validates that parsed values are actually in 0–1 float range.
-  - Shows live min/max so you can verify sensors are responding.
-  - Saves after EVERY sample (not just at end) — no data loss on crash.
-  - Backs up existing data_v2.csv before overwriting.
- 
-Usage:
-    python collect_data.py
- 
-Workflow:
-    1. Connect ESP32 via USB
-    2. Run this script
-    3. Follow prompts — simulate Relax / Stressed / Fatigued / Anomaly
-    4. Script saves labeled data to data_v2.csv
-    5. Then run neurogrip.py — model trains on your data
-"""
- 
-import serial
+import argparse
 import csv
-import time
 import os
-import shutil
-import numpy as np
-from collections import deque
+import random
+import time
 from datetime import datetime
- 
-# ──────────────────────────────────────────────
-#  CONFIG — edit port if needed
-# ──────────────────────────────────────────────
-CONFIG = {
-    "port":      "COM5",        # ← change to your port (Linux: /dev/ttyUSB0)
-    "baud":      115200,
-    "data_path": "data_v2.csv",
-    "sample_rate": 20,          # Hz — must match ESP32 SAMPLE_RATE_HZ
+
+import numpy as np
+import serial
+import serial.tools.list_ports
+
+DATA_PATH = "data_v3.csv"
+HEADER = ["fsr", "gsr", "tremor", "label", "session", "person"]
+
+CLASSES = {
+    0: ("Relax", "Rest both hands on the wheel normally. Light, steady, comfortable grip."),
+    1: ("Stressed", "Grip HARD and hold it. Mix it up between rounds: some moderate-tight, "
+                    "some as hard as you can sustain. Keep the hands still."),
+    2: ("Fatigued", "Loose, heavy hands. Let the grip slowly sag and drift, nearly letting go "
+                    "now and then, like you're fighting sleep."),
+    3: ("Anomaly", "Sudden events: quick hard squeeze then release, jerky grabs, and shake "
+                   "the wheel with small trembling movements."),
 }
- 
-LABELS = {
-    0: "Relax      (rest hands normally on wheel — no pressure)",
-    1: "Stressed   (grip tight, tense up, press hard)",
-    2: "Fatigued   (loose, droopy, barely touching)",
-    3: "Anomaly    (sudden squeeze then release, trembling)",
-}
- 
-# ──────────────────────────────────────────────
-#  CONNECT
-# ──────────────────────────────────────────────
-def connect():
+
+
+def find_port():
+    ports = list(serial.tools.list_ports.comports())
+    for p in ports:
+        d = f"{p.description} {p.manufacturer or ''}".lower()
+        if any(k in d for k in ("cp210", "ch340", "ch910", "usb-serial", "usb serial", "uart", "esp32", "silicon labs", "wch")):
+            return p.device
+    return ports[0].device if len(ports) == 1 else None
+
+
+def connect(port):
+    port = port or find_port()
+    if not port:
+        print("Couldn't find the ESP32. Plug it in, then run with --port COMx")
+        print("Ports seen:", [p.device for p in serial.tools.list_ports.comports()] or "none")
+        return None
     try:
-        s = serial.Serial(CONFIG["port"], CONFIG["baud"], timeout=2)
-        time.sleep(2)          # wait for ESP32 boot
-        s.flushInput()
-        print(f"✅ Connected to ESP32 on {CONFIG['port']}\n")
+        s = serial.Serial(port, 115200, timeout=2)
+        time.sleep(2)
+        s.reset_input_buffer()
+        print(f"Connected to ESP32 on {port}")
         return s
     except Exception as e:
-        print(f"❌ Cannot connect: {e}")
-        print("   Make sure:")
-        print("   - ESP32 is plugged in")
-        print("   - Port is correct (check Device Manager / dmesg)")
-        print("   - No other program (Arduino Serial Monitor) has the port open")
+        print(f"Can't open {port}: {e}")
+        print("Close the Arduino Serial Monitor (and neurogrip.py) if they're open, then retry.")
         return None
- 
- 
-# ──────────────────────────────────────────────
-#  PARSE ONE SERIAL LINE
-# ──────────────────────────────────────────────
+
+
 def parse_line(line):
-    """
-    ESP32 sends processed normalized values: "0.1234 0.4879 0.0073"
-    Returns np.array of 3 floats in [0,1], or None if line is garbage.
-    """
-    # Skip all known non-data lines
-    if not line:
-        return None
-    skip_prefixes = ("HB", "NEUROGRIP", "RAW:", "QUEUE", "Read_us", "Proc_us", "#", "//")
-    for pfx in skip_prefixes:
-        if line.startswith(pfx):
-            return None
- 
     parts = line.split()
     if len(parts) != 3:
-        return None
- 
+        return None             # skips HB, NEUROGRIP_READY, MPU_OK, etc.
     try:
-        vals = np.array([float(p) for p in parts])
+        v = np.array([float(p) for p in parts])
     except ValueError:
         return None
- 
-    # Sanity check — ESP32 normalizes to [0,1]
-    # If values are huge (>10) you're reading raw ADC — firmware mismatch!
-    if np.any(vals > 10.0) or np.any(vals < -1.0):
-        print(f"\n⚠️  WARNING: Got out-of-range values: {vals}")
-        print("   Your ESP32 firmware may be sending RAW ADC instead of normalized.")
-        print("   Check SAMPLE_RATE_HZ and the commsTask in your .ino file.")
+    if np.any(v > 10) or np.any(v < -1):
         return None
- 
-    return vals
- 
- 
-# ──────────────────────────────────────────────
-#  COLLECT ONE SESSION
-# ──────────────────────────────────────────────
-def collect_session(ser, label_idx, duration_sec=15):
-    """
-    Collect `duration_sec` seconds of labeled sensor data.
-    NO extra filtering here — ESP32 already EMA-filters.
-    Returns list of [fsr, gsr, tremor] samples.
-    """
-    print(f"\n⏳ Collecting {duration_sec}s  →  Class [{label_idx}]  {LABELS[label_idx]}")
-    print("   START NOW →", flush=True)
- 
-    samples = []
-    mins = np.ones(3) * 9999
-    maxs = np.zeros(3)
- 
-    t0 = time.time()
-    timeout_warn = False
- 
-    while (time.time() - t0) < duration_sec:
-        try:
-            raw_line = ser.readline()
-            if not raw_line:
-                if not timeout_warn:
-                    print("\n   ⚠️  No data from ESP32 — check connection")
-                    timeout_warn = True
-                continue
-            timeout_warn = False
- 
-            line = raw_line.decode(errors="ignore").strip()
-            vals = parse_line(line)
-            if vals is None:
-                continue
- 
-            samples.append(vals.tolist())
-            mins = np.minimum(mins, vals)
-            maxs = np.maximum(maxs, vals)
- 
-            remaining = int(duration_sec - (time.time() - t0))
-            print(
-                f"\r   FSR={vals[0]:.3f}  GSR={vals[1]:.3f}  Tremor={vals[2]:.3f}"
-                f"  |  Samples:{len(samples):4d}  |  {remaining:2d}s left   ",
-                end="", flush=True
-            )
- 
-        except serial.SerialException as e:
-            print(f"\n❌ Serial error: {e}")
-            break
-        except Exception:
+    return v
+
+
+def stream(ser, seconds, label=None):
+    ser.reset_input_buffer()
+    samples, t0 = [], time.time()
+    while time.time() - t0 < seconds:
+        raw = ser.readline()
+        if not raw:
+            print("\n  no data from ESP32, check the cable")
             continue
- 
-    print(f"\n   ✅ Collected {len(samples)} samples for class {label_idx}")
-    if len(samples) > 0:
-        print(f"   Range — FSR:[{mins[0]:.3f}~{maxs[0]:.3f}]  "
-              f"GSR:[{mins[1]:.3f}~{maxs[1]:.3f}]  "
-              f"Tremor:[{mins[2]:.3f}~{maxs[2]:.3f}]")
- 
-        # Warn if FSR barely moved (sensor not responding)
-        if (maxs[0] - mins[0]) < 0.01:
-            print("   ⚠️  FSR barely changed! Check wiring on Pin 34.")
-        if (maxs[1] - mins[1]) < 0.005:
-            print("   ⚠️  GSR barely changed! Check wiring on Pin 35.")
-    else:
-        print("   ❌ No valid samples collected! Check ESP32 output.")
- 
-    return samples
- 
- 
-# ──────────────────────────────────────────────
-#  SAVE SAMPLES (append to CSV)
-# ──────────────────────────────────────────────
-def save_samples(samples, label_idx, path):
-    if not samples:
+        v = parse_line(raw.decode(errors="ignore").strip())
+        if v is None:
+            continue
+        samples.append(v.tolist())
+        left = int(seconds - (time.time() - t0))
+        print(f"\r  FSR={v[0]:.3f}  GSR={v[1]:.3f}  Tremor={v[2]:.3f}  | {len(samples):4d} samples | {left:2d}s left ",
+              end="", flush=True)
+    print()
+    return np.array(samples)
+
+
+def verify(ser):
+    print("\nSensor check (8 s): squeeze the FSR, turn the GSR knob, and tap/shake the wheel.")
+    s = stream(ser, 8)
+    if len(s) < 50:
+        print(f"  Only {len(s)} samples in 8 s (expected ~160). Check the firmware is running.")
         return
- 
-    mode = "a" if os.path.exists(path) else "w"
-    with open(path, mode, newline="") as f:
+    rng = s.max(0) - s.min(0)
+    print(f"  {len(s)/8:.0f} samples/s   range FSR {rng[0]:.3f}  GSR {rng[1]:.3f}  Tremor {rng[2]:.3f}")
+    if rng[0] < 0.05: print("  FSR barely moved: check GPIO34 wiring.")
+    if rng[1] < 0.02: print("  GSR barely moved: check the pot on GPIO35.")
+    if rng[2] < 0.05: print("  Tremor barely moved: is the MPU6050 working? (Arduino Serial Monitor should say MPU_OK at boot.)")
+    if s[:, 2].min() > 0.3: print("  Tremor never drops low even when still: raise TREMOR_ACC_FS_G / TREMOR_GYRO_FS_DPS in the .ino.")
+
+
+def save(samples, label, session, person):
+    new = not os.path.exists(DATA_PATH)
+    with open(DATA_PATH, "a", newline="") as f:
         w = csv.writer(f)
+        if new:
+            w.writerow(HEADER)
         for s in samples:
-            w.writerow(s + [label_idx])
- 
-    # Count current totals per class
-    counts = {0: 0, 1: 0, 2: 0, 3: 0}
-    with open(path) as f:
-        for row in csv.reader(f):
+            w.writerow([f"{s[0]:.4f}", f"{s[1]:.4f}", f"{s[2]:.4f}", label, session, person])
+    counts, sessions = [0] * 4, [set() for _ in range(4)]
+    with open(DATA_PATH, newline="") as f:
+        for r in csv.reader(f):
             try:
-                counts[int(row[-1])] += 1
-            except:
+                c = int(r[3]); counts[c] += 1; sessions[c].add(r[4])
+            except (ValueError, IndexError):
                 pass
- 
-    print(f"   💾 Saved {len(samples)} samples (label={label_idx}) → {path}")
-    print(f"   📊 Dataset totals: "
-          f"Relax={counts[0]}  Stressed={counts[1]}  "
-          f"Fatigued={counts[2]}  Anomaly={counts[3]}  "
-          f"Total={sum(counts.values())}")
- 
- 
-# ──────────────────────────────────────────────
-#  VERIFY SENSOR (live stream for 5s)
-# ──────────────────────────────────────────────
-def verify_sensors(ser):
-    """Quick 5-second live read so you can confirm sensors work before collecting."""
-    print("\n🔍 Sensor Verification (5 seconds) — Move your hand on the FSR now...")
-    t0 = time.time()
-    count = 0
-    while (time.time() - t0) < 5:
-        try:
-            line = ser.readline().decode(errors="ignore").strip()
-            vals = parse_line(line)
-            if vals is None:
-                continue
-            count += 1
-            print(f"\r   FSR={vals[0]:.4f}  GSR={vals[1]:.4f}  Tremor={vals[2]:.4f}  "
-                  f"[{count} samples/5s]", end="", flush=True)
-        except:
-            continue
-    print(f"\n   → Received {count} samples in 5 seconds (~{count//5} Hz)")
-    if count < 10:
-        print("   ⚠️  Very few samples! ESP32 may not be sending data correctly.")
-        print("      Expected ~20 samples/sec. Check firmware SAMPLE_RATE_HZ.")
-    else:
-        print("   ✅ Sensors responding correctly!")
- 
- 
-# ──────────────────────────────────────────────
-#  BACKUP EXISTING DATA
-# ──────────────────────────────────────────────
-def backup_data(path):
-    if os.path.exists(path):
-        backup = path.replace(".csv", f"_backup_{datetime.now().strftime('%H%M%S')}.csv")
-        shutil.copy(path, backup)
-        print(f"   📁 Backed up existing data → {backup}")
- 
- 
-# ──────────────────────────────────────────────
-#  MAIN
-# ──────────────────────────────────────────────
+    print("  Dataset now: " + "  ".join(f"{CLASSES[i][0]} {counts[i]} ({len(sessions[i])} rounds)" for i in range(4)))
+
+
+def record_round(ser, label, person, seconds):
+    name, how = CLASSES[label]
+    print(f"\n--- [{label}] {name} ---")
+    print(f"  {how}")
+    print("  Set the GSR knob to ANY position (don't match it to the class).")
+    input("  Get into position, then press ENTER to start ...")
+    for c in (3, 2, 1):
+        print(f"  {c}...", end=" ", flush=True); time.sleep(0.7)
+    print("GO")
+    s = stream(ser, seconds, label)
+    if len(s) < seconds * 10:
+        print(f"  Only {len(s)} samples: round discarded.")
+        return False
+    ans = input("  Keep this round? (ENTER = yes, n = discard): ").strip().lower()
+    if ans == "n":
+        print("  Discarded.")
+        return False
+    session = f"{person}-{datetime.now().strftime('%m%d-%H%M%S')}-c{label}"
+    save(s, label, session, person)
+    return True
+
+
 def main():
-    ser = connect()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--person", required=True, help="who is holding the wheel, e.g. janavi / hardik / akhil")
+    ap.add_argument("--port")
+    ap.add_argument("--seconds", type=int, default=15)
+    ap.add_argument("--rounds", type=int, default=3, help="guided mode: rounds per class in this sitting")
+    ap.add_argument("--manual", action="store_true")
+    a = ap.parse_args()
+    person = a.person.strip().lower().replace(",", "")
+
+    ser = connect(a.port)
     if not ser:
         return
- 
-    print("\n" + "=" * 60)
-    print("  NeuroGrip Data Collection Tool  (Fixed v2.1)")
-    print("  Collect labeled grip data from your hands")
-    print("=" * 60)
- 
-    print("\nSensor channels (ESP32 sends normalized 0.0–1.0):")
-    print("  Ch 0  FSR     Pin 34  — Grip pressure")
-    print("  Ch 1  GSR     Pin 35  — Bio-impedance proxy (sweat/stress)")
-    print("  Ch 2  Tremor  Pin 32  — Micro-movement proxy\n")
- 
-    print("Classes:")
-    for k, v in LABELS.items():
-        print(f"  [{k}] {v}")
- 
-    print("\n💡 Tips for good data:")
-    print("   - Collect AT LEAST 3 rounds × 15s per class = ~900 samples/class")
-    print("   - Both Janavi AND Hardik should collect separately")
-    print("   - Actually change your grip for each class — don't fake it")
-    print("   - Collect in the same environment you'll use the system\n")
- 
-    # Backup existing data
-    backup_data(CONFIG["data_path"])
- 
-    # Sensor check
-    print("\nPress ENTER to run a quick sensor verification, or 's' to skip: ", end="")
-    choice = input().strip().lower()
-    if choice != 's':
-        verify_sensors(ser)
- 
-    total = 0
+    if input("Run the sensor check first? (ENTER = yes, s = skip): ").strip().lower() != "s":
+        verify(ser)
+
     try:
-        while True:
-            print("\n" + "-" * 50)
-            print("Which class? (0/1/2/3) or 'q' to quit: ", end="")
-            choice = input().strip()
-            if choice.lower() == 'q':
-                break
-            try:
-                label_idx = int(choice)
-                if label_idx not in LABELS:
-                    print("Invalid. Choose 0–3.")
-                    continue
-            except ValueError:
-                print("Invalid input.")
-                continue
- 
-            print(f"Duration in seconds? (default 15, min 10): ", end="")
-            dur_str = input().strip()
-            try:
-                dur = max(10, int(dur_str)) if dur_str else 15
-            except ValueError:
-                dur = 15
- 
-            input(f"\nPress ENTER when ready → class [{label_idx}]  {LABELS[label_idx]}")
- 
-            # Flush stale serial buffer before collecting
-            ser.flushInput()
- 
-            samples = collect_session(ser, label_idx, dur)
-            if samples:
-                save_samples(samples, label_idx, CONFIG["data_path"])
-                total += len(samples)
-                print(f"\n   Running total: {total} samples collected this session")
-            else:
-                print("   No samples saved. Try again.")
- 
+        if a.manual:
+            while True:
+                c = input("\nClass 0 Relax / 1 Stressed / 2 Fatigued / 3 Anomaly, or q to quit: ").strip()
+                if c.lower() == "q":
+                    break
+                if c in ("0", "1", "2", "3"):
+                    record_round(ser, int(c), person, a.seconds)
+        else:
+            plan = [c for c in range(4) for _ in range(a.rounds)]
+            random.shuffle(plan)
+            print(f"\nGuided session: {len(plan)} rounds of {a.seconds}s in shuffled order. Ctrl+C stops any time; finished rounds are already saved.")
+            for i, c in enumerate(plan, 1):
+                print(f"\nRound {i}/{len(plan)}")
+                while not record_round(ser, c, person, a.seconds):
+                    if input("  Redo this round? (ENTER = yes, s = skip): ").strip().lower() == "s":
+                        break
     except KeyboardInterrupt:
-        pass
- 
-    print(f"\n\n✅ Data collection complete.")
-    print(f"   Session total: {total} samples")
-    print(f"   Saved to: {CONFIG['data_path']}")
-    print(f"\n   Next step: run   python neurogrip.py")
-    print(f"   The model will train on your collected data.\n")
- 
+        print("\nStopped.")
     ser.close()
- 
- 
+    print(f"\nSaved to {DATA_PATH}. Next: python train_eval.py")
+
+
 if __name__ == "__main__":
     main()
